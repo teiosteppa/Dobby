@@ -2,14 +2,18 @@
 
 #include "PlatformUnifiedInterface/ExecMemory/ClearCacheTool.h"
 
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #include "UnifiedInterface/platform-darwin/mach_vm.h"
 
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #include <mach/vm_statistics.h>
+#include <mach-o/dyld.h>
 #endif
 
 #define KERN_RETURN_ERROR(kr, failure)                                                                                 \
@@ -21,6 +25,8 @@
   } while (0);
 
 #include <sys/mman.h>
+
+static int use_jit_bypass = -1;
 
 #if defined(TARGET_ARCH_ARM64)
 #define SYS_mprotect 74
@@ -35,9 +41,87 @@ int mprotect_impl(void *addr, size_t len, int prot) {
                        :);
   return ret;
 }
+
+extern "C" {
+    __attribute__((noinline,optnone,naked))
+    void BreakJITWrite(void* dest, void* src, size_t bytes) {
+        __asm__("brk #0x70 \n ret");
+    }
+}
 #endif
 
+#if defined(__APPLE__)
+static bool is_macos_hardware() {
+    bool is_mac = false;
+    void* objc_lib = dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY);
+    if (!objc_lib) return false;
+
+    typedef void* (*objc_getClass_t)(const char*);
+    typedef void* (*sel_registerName_t)(const char*);
+    typedef void* (*objc_msgSend_ptr_t)(void*, void*);
+    typedef bool  (*objc_msgSend_bool_t)(void*, void*);
+    typedef void* (*object_getClass_t)(void*);
+    typedef bool  (*class_respondsToSelector_t)(void*, void*);
+
+    void* sym_getClass = dlsym(objc_lib, "objc_getClass");
+    void* sym_selReg = dlsym(objc_lib, "sel_registerName");
+    void* sym_msgSend = dlsym(objc_lib, "objc_msgSend");
+    void* sym_objGetClass = dlsym(objc_lib, "object_getClass");
+    void* sym_responds = dlsym(objc_lib, "class_respondsToSelector");
+
+    if (sym_getClass && sym_selReg && sym_msgSend && sym_objGetClass && sym_responds) {
+        auto my_objc_getClass = (objc_getClass_t)sym_getClass;
+        auto my_sel_registerName = (sel_registerName_t)sym_selReg;
+        auto msgSend_ptr = (objc_msgSend_ptr_t)sym_msgSend;
+        auto msgSend_bool = (objc_msgSend_bool_t)sym_msgSend;
+        auto my_object_getClass = (object_getClass_t)sym_objGetClass;
+        auto my_class_respondsToSelector = (class_respondsToSelector_t)sym_responds;
+
+        void* cls = my_objc_getClass("NSProcessInfo");
+        if (cls) {
+            void* processInfo = msgSend_ptr(cls, my_sel_registerName("processInfo"));
+            if (processInfo) {
+                void* sel_isMac = my_sel_registerName("isiOSAppOnMac");
+                void* obj_cls = my_object_getClass(processInfo);
+
+                if (my_class_respondsToSelector(obj_cls, sel_isMac)) {
+                    is_mac = msgSend_bool(processInfo, sel_isMac);
+                }
+            }
+        }
+    }
+
+    dlclose(objc_lib);
+    return is_mac;
+}
+#else
+static bool is_macos_hardware() { return false; }
+#endif
+
+void init_os_version() {
+  use_jit_bypass = 0;
+  bool is_mac = is_macos_hardware();
+
+  bool is_ios26_plus = false;
+  char os_version[32] = {0};
+  size_t size = sizeof(os_version);
+  if (sysctlbyname("kern.osproductversion", os_version, &size, NULL, 0) == 0) {
+    long major = strtol(os_version, NULL, 10);
+    if (major >= 26) {
+      is_ios26_plus = true;
+    }
+  }
+
+  if (!is_mac && is_ios26_plus) {
+    use_jit_bypass = 1;
+  }
+}
+
 PUBLIC int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) {
+  // this should only run once
+  if (use_jit_bypass == -1) {
+    init_os_version();
+  }
   if (address == nullptr || buffer == nullptr || buffer_size == 0) {
     ERROR_LOG("invalid argument");
     return -1;
@@ -62,6 +146,14 @@ PUBLIC int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) 
     ret = DobbyCodePatch(address_b, buffer_b, buffer_size_b);
     return ret;
   }
+#if defined(__APPLE__)
+  // stop here and notify debugger
+  if (use_jit_bypass == 1) {
+    BreakJITWrite(address, buffer, buffer_size);
+    ClearCache(address, (void *)((addr_t)address + buffer_size));
+    return 0;
+  }
+#endif
 
   addr_t remap_dest_page = patch_page;
   mach_vm_address_t remap_dummy_page = 0;
